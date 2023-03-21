@@ -9,7 +9,7 @@
 // @homepage        https://m417z.com/
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -DWINVER=0x0605 -lole32
+// @compilerOptions -DWINVER=0x0605 -loleaut32 -lole32 -lruntimeobject
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -50,13 +50,20 @@ Tweaker](https://tweaker.ramensoftware.com/).
   $name: Taskbar height
   $description: >-
     The height, in pixels, of the taskbar (Windows 11 default: 48)
+- TaskbarItemWidth: 52
+  $name: Item width
+  $description: >-
+    The width in pixels of items on the taskbar
 */
 // ==/WindhawkModSettings==
+#undef GetCurrentTime
 
 #include <initguid.h>  // must come before knownfolders.h
 
 #include <knownfolders.h>
 #include <shlobj.h>
+
+#include <winrt/Windows.UI.Xaml.Media.h>
 
 #include <algorithm>
 #include <atomic>
@@ -65,6 +72,8 @@ Tweaker](https://tweaker.ramensoftware.com/).
 #include <string_view>
 #include <vector>
 
+using namespace winrt::Windows::UI::Xaml;
+
 #ifndef SPI_SETLOGICALDPIOVERRIDE
 #define SPI_SETLOGICALDPIOVERRIDE 0x009F
 #endif
@@ -72,6 +81,7 @@ Tweaker](https://tweaker.ramensoftware.com/).
 struct {
     int iconSize;
     int taskbarHeight;
+    int taskbarItemWidth;
 } g_settings;
 
 WCHAR g_taskbarViewDllPath[MAX_PATH];
@@ -81,8 +91,13 @@ std::atomic<bool> g_unloading = false;
 
 int g_originalTaskbarHeight;
 int g_taskbarHeight;
+double g_initialTaskbarItemWidth;
 
 double* double_48_value_Original;
+
+#ifndef SPI_SETLOGICALDPIOVERRIDE
+#define SPI_SETLOGICALDPIOVERRIDE 0x009F
+#endif
 
 WINUSERAPI UINT WINAPI GetDpiForWindow(HWND hwnd);
 
@@ -245,6 +260,7 @@ auto WINAPI SHAppBarMessage_Hook(DWORD dwMessage, PAPPBARDATA pData) {
 void LoadSettings() {
     g_settings.iconSize = Wh_GetIntSetting(L"IconSize");
     g_settings.taskbarHeight = Wh_GetIntSetting(L"TaskbarHeight");
+    g_settings.taskbarItemWidth = Wh_GetIntSetting(L"TaskbarItemWidth");
 }
 
 void FreeSettings() {
@@ -277,6 +293,56 @@ bool ProtectAndMemcpy(DWORD protect, void* dst, const void* src, size_t size) {
     VirtualProtect(dst, size, oldProtect, &oldProtect);
     return true;
 }
+
+
+void RecalculateWidth() {
+    HWND hTaskbarWnd = GetTaskbarWnd();
+    if (!hTaskbarWnd) {
+        return;
+    }
+
+    HWND hReBarWindow32 =
+        FindWindowEx(hTaskbarWnd, nullptr, L"ReBarWindow32", nullptr);
+    if (!hReBarWindow32) {
+        return;
+    }
+
+    HWND hMSTaskSwWClass =
+        FindWindowEx(hReBarWindow32, nullptr, L"MSTaskSwWClass", nullptr);
+    if (!hMSTaskSwWClass) {
+        return;
+    }
+
+    // Trigger CTaskBand::_HandleSyncDisplayChange.
+    SendMessage(hMSTaskSwWClass, 0x452, 3, 0);
+}
+
+// {0BD894F2-EDFC-5DDF-A166-2DB14BBFDF35}
+constexpr winrt::guid IItemsRepeater{
+    0x0BD894F2,
+    0xEDFC,
+    0x5DDF,
+    {0xA1, 0x66, 0x2D, 0xB1, 0x4B, 0xBF, 0xDF, 0x35}};
+
+FrameworkElement ItemsRepeater_TryGetElement(
+    FrameworkElement taskbarFrameRepeaterElement,
+    int index) {
+    winrt::Windows::Foundation::IUnknown pThis = nullptr;
+    taskbarFrameRepeaterElement.as(IItemsRepeater, winrt::put_abi(pThis));
+
+    using TryGetElement_t =
+        void*(WINAPI*)(void* pThis, int index, void** uiElement);
+
+    void** vtable = *(void***)winrt::get_abi(pThis);
+    auto TryGetElement = (TryGetElement_t)vtable[20];
+
+    void* uiElement = nullptr;
+    TryGetElement(winrt::get_abi(pThis), index, &uiElement);
+
+    return UIElement{uiElement, winrt::take_ownership_from_abi}
+        .try_as<FrameworkElement>();
+}
+
 
 void ApplySettings(int taskbarHeight) {
     if (taskbarHeight < 2) {
@@ -347,6 +413,8 @@ void ApplySettings(int taskbarHeight) {
         }
     }
 
+    RecalculateWidth();    
+
     // Sometimes, the height doesn't fully apply at this point, and there's
     // still a transparent line at the bottom of the taskbar. Triggering
     // TrayUI::_HandleSettingChange again works as a workaround.
@@ -355,6 +423,180 @@ void ApplySettings(int taskbarHeight) {
 
     g_applyingSettings = false;
 }
+
+FrameworkElement FindChildByName(FrameworkElement element, PCWSTR name, bool doLog = false) {
+    int childrenCount = Media::VisualTreeHelper::GetChildrenCount(element);
+
+    for (int i = 0; i < childrenCount; i++) {
+        auto child = Media::VisualTreeHelper::GetChild(element, i)
+                         .try_as<FrameworkElement>();
+        if (!child) {
+            Wh_Log(L"Failed to get child %d of %d", i + 1, childrenCount);
+            continue;
+        }
+        if (doLog) {
+            Wh_Log(L"%s", child.Name().c_str());
+        }       
+        if (child.Name() == name) {
+            return child;
+        }
+    }
+
+    return nullptr;
+}
+
+void UpdateTaskListButtonWidth(FrameworkElement taskListButtonElement,
+                               double widthToSet,
+                               bool showLabels) {
+    auto iconPanelElement =
+        FindChildByName(taskListButtonElement, L"IconPanel");
+
+    if (!iconPanelElement) {
+        auto experiencePanelElement = FindChildByName(taskListButtonElement, L"ExperienceToggleButtonRootPanel");
+        if (experiencePanelElement) {
+            taskListButtonElement.Width(widthToSet);
+            experiencePanelElement.MinWidth(widthToSet);            
+            return;
+        }
+        return;
+    }        
+
+    // Reset in case an old version of the mod was installed.
+    taskListButtonElement.Width(std::numeric_limits<double>::quiet_NaN());
+
+    iconPanelElement.Width(widthToSet);
+}
+
+void UpdateTaskListButtonCustomizations(
+    FrameworkElement taskListButtonElement) {
+
+    auto iconPanelElement =
+        FindChildByName(taskListButtonElement, L"IconPanel");
+        
+    if (!iconPanelElement) {
+        iconPanelElement = FindChildByName(taskListButtonElement, L"ExperienceToggleButtonRootPanel");
+    }            
+    if (!iconPanelElement) {
+        return;
+    } 
+
+    auto taskbarFrameRepeaterElement =
+        Media::VisualTreeHelper::GetParent(taskListButtonElement)
+            .as<FrameworkElement>();
+
+    if (!taskbarFrameRepeaterElement ||
+        taskbarFrameRepeaterElement.Name() != L"TaskbarFrameRepeater") {
+        // Can also be "OverflowFlyoutListRepeater".
+        return;
+    }
+
+    double taskListButtonWidth = taskListButtonElement.ActualWidth();
+
+    double iconPanelWidth = iconPanelElement.ActualWidth();
+
+    // Check if non-positive or NaN.
+    if (!(taskListButtonWidth > 0) || !(iconPanelWidth > 0)) {
+        return;
+    }
+
+    if (!g_initialTaskbarItemWidth) {
+        g_initialTaskbarItemWidth = iconPanelWidth;
+    }
+
+    bool adjustWidth = !g_unloading;
+
+    double widthToSet;
+
+    if (adjustWidth) {
+        widthToSet = g_settings.taskbarItemWidth;       
+    } else {
+        widthToSet = g_initialTaskbarItemWidth;
+    }
+
+    UpdateTaskListButtonWidth(taskListButtonElement, widthToSet, adjustWidth);
+}
+
+using TaskListButton_UpdateVisualStates_t = void(WINAPI*)(void* pThis);
+TaskListButton_UpdateVisualStates_t TaskListButton_UpdateVisualStates_Original;
+void WINAPI TaskListButton_UpdateVisualStates_Hook(void* pThis) {
+    Wh_Log(L">");
+
+    TaskListButton_UpdateVisualStates_Original(pThis);
+
+    void* taskListButtonIUnknownPtr = (void**)pThis + 3;
+    winrt::Windows::Foundation::IUnknown taskListButtonIUnknown;
+    winrt::copy_from_abi(taskListButtonIUnknown, taskListButtonIUnknownPtr);
+
+    auto taskListButtonElement = taskListButtonIUnknown.as<FrameworkElement>();
+
+    UpdateTaskListButtonCustomizations(taskListButtonElement);
+}
+
+using TaskListButton_UpdateButtonPadding_t = void(WINAPI*)(void* pThis);
+TaskListButton_UpdateButtonPadding_t
+    TaskListButton_UpdateButtonPadding_Original;
+void WINAPI TaskListButton_UpdateButtonPadding_Hook(void* pThis) {
+    Wh_Log(L">");
+
+    TaskListButton_UpdateButtonPadding_Original(pThis);
+
+    void* taskListButtonIUnknownPtr = (void**)pThis + 3;
+    winrt::Windows::Foundation::IUnknown taskListButtonIUnknown;
+    winrt::copy_from_abi(taskListButtonIUnknown, taskListButtonIUnknownPtr);
+
+    auto taskListButtonElement = taskListButtonIUnknown.as<FrameworkElement>();
+
+    UpdateTaskListButtonCustomizations(taskListButtonElement);
+}
+
+using TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_t =
+    void(WINAPI*)(void* pThis);
+TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_t
+    TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_Original;
+void WINAPI TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_Hook(void* pThis) {
+    Wh_Log(L">");
+
+    TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_Original(pThis);
+
+    void* taskbarFrameIUnknownPtr = (void**)pThis + 3;
+    winrt::Windows::Foundation::IUnknown taskbarFrameIUnknown;
+    winrt::copy_from_abi(taskbarFrameIUnknown, taskbarFrameIUnknownPtr);
+
+    auto taskbarFrameElement = taskbarFrameIUnknown.as<FrameworkElement>();
+
+    auto taskbarFrameRepeaterContainerElement =
+        FindChildByName(taskbarFrameElement, L"RootGrid");
+    if (!taskbarFrameRepeaterContainerElement) {
+        // For older versions (pre-KB5022913).
+        taskbarFrameRepeaterContainerElement =
+            FindChildByName(taskbarFrameElement, L"TaskbarFrameBorder");
+    }
+
+    if (!taskbarFrameRepeaterContainerElement) {
+        return;
+    }
+
+    auto taskbarFrameRepeaterElement = FindChildByName(
+        taskbarFrameRepeaterContainerElement, L"TaskbarFrameRepeater");
+    if (!taskbarFrameRepeaterElement) {
+        return;
+    }
+
+    for (int i = 0;; i++) {
+        auto child =
+            ItemsRepeater_TryGetElement(taskbarFrameRepeaterElement, i);
+        if (!child) {
+            break;
+        }
+
+        //Wh_Log(L"%s", child.Name().c_str());
+
+        if (child.Name() == L"TaskListButton" || child.Name() == L"LaunchListButton") {
+            UpdateTaskListButtonCustomizations(child);
+        }
+    }
+}
+
 
 struct SYMBOL_HOOK {
     std::vector<std::wstring_view> symbols;
@@ -664,6 +906,30 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
             (void**)&TaskbarFrame_Height_double_Original,
             (void*)TaskbarFrame_Height_double_Hook,
         },
+        {
+            {
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates(void))",
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates(void) __ptr64)",
+            },
+            (void**)&TaskListButton_UpdateVisualStates_Original,
+            (void*)TaskListButton_UpdateVisualStates_Hook,
+        },
+        {
+            {
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateButtonPadding(void))",
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateButtonPadding(void) __ptr64)",
+            },
+            (void**)&TaskListButton_UpdateButtonPadding_Original,
+            (void*)TaskListButton_UpdateButtonPadding_Hook,
+        }, 
+        {
+            {
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskbarFrame::OnTaskbarLayoutChildBoundsChanged(void))",
+                LR"(private: void __cdecl winrt::Taskbar::implementation::TaskbarFrame::OnTaskbarLayoutChildBoundsChanged(void) __ptr64)",
+            },
+            (void**)&TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_Original,
+            (void*)TaskbarFrame_OnTaskbarLayoutChildBoundsChanged_Hook,
+        }                       
     };
 
     return HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
@@ -786,6 +1052,7 @@ void Wh_ModBeforeUninit() {
 
     if (g_taskbarViewDllLoaded) {
         ApplySettings(g_originalTaskbarHeight ? g_originalTaskbarHeight : 48);
+        Sleep(400);
     }
 }
 
